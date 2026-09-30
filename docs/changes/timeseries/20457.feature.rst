@@ -1,0 +1,7 @@
+``BoxLeastSquares`` now accepts a per-observation exposure duration via the
+new ``exptime`` argument. When provided, ``power``, ``model``,
+``transit_mask``, and ``compute_stats`` treat each observation as the
+average of the box-shaped transit signal over its exposure window instead
+of an instantaneous sample, so the smearing of short transits by long
+exposures is accounted for. Zero exposure times reproduce the previous
+results exactly.
