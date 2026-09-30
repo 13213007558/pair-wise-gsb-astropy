@@ -11,6 +11,7 @@ from astropy.timeseries.periodograms.base import BasePeriodogram
 from astropy.timeseries.periodograms.lombscargle.core import has_units, strip_units
 
 from . import methods
+from .window import single_transit_fraction, transit_fraction
 
 
 def validate_unit_consistency(reference_object, input_object):
@@ -39,6 +40,12 @@ class BoxLeastSquares(BasePeriodogram):
         Sequence of observations associated with times ``t``.
     dy : float, array-like, or `~astropy.units.Quantity`, optional
         Error or sequence of observational errors associated with times ``t``.
+    exposure_time : float, array-like, or `~astropy.units.Quantity` ['time'], optional
+        Duration of each observation exposure, centered on the corresponding
+        value of ``t``. When provided, model values are averaged over each
+        exposure window. Exposures may cross a phase boundary or span more
+        than one period. A value of zero, the default, treats observations as
+        instantaneous.
 
     Examples
     --------
@@ -87,7 +94,7 @@ class BoxLeastSquares(BasePeriodogram):
 
     """
 
-    def __init__(self, t, y, dy=None):
+    def __init__(self, t, y, dy=None, exposure_time=None):
         # If t is a TimeDelta, convert it to a quantity. The units we convert
         # to don't really matter since the user gets a Quantity back at the end
         # so can convert to any units they like.
@@ -107,7 +114,10 @@ class BoxLeastSquares(BasePeriodogram):
             self._tstart = None
             trel = self.t
 
-        self._trel, self.y, self.dy = self._validate_inputs(trel, y, dy)
+        self.exposure_time = exposure_time
+        self._trel, self.y, self.dy, self.exposure_time = self._validate_inputs(
+            trel, y, dy, exposure_time
+        )
 
     def autoperiod(
         self,
@@ -264,8 +274,9 @@ class BoxLeastSquares(BasePeriodogram):
             The computational method used to compute the periodogram. This is
             mainly included for the purposes of testing and most users will
             want to use the optimized ``'fast'`` method (default) that is
-            implemented in Cython.  ``'slow'`` is a brute-force method that is
-            used to test the results of the ``'fast'`` method.
+            implemented in Cython for instantaneous observations. When
+            ``exposure_time`` is nonzero, both methods evaluate the exact
+            exposure-window average, with ``'slow'`` retained as a reference.
         oversample : int, optional
             The number of bins per duration that should be used. This sets the
             time resolution of the phase fit with larger values of
@@ -329,23 +340,38 @@ class BoxLeastSquares(BasePeriodogram):
         # Make sure that the period and duration arrays are C-order
         period_fmt = np.ascontiguousarray(strip_units(period), dtype=np.float64)
         duration = np.ascontiguousarray(strip_units(duration), dtype=np.float64)
+        exposure_time = np.ascontiguousarray(
+            strip_units(self.exposure_time), dtype=np.float64
+        )
 
         # Select the correct implementation for the chosen method
-        if method == "fast":
-            bls = methods.bls_fast
+        if np.all(exposure_time == 0.0):
+            bls = methods.bls_fast if method == "fast" else methods.bls_slow
         else:
-            bls = methods.bls_slow
+            bls = methods.bls_integrated
 
         # Run the implementation
-        results = bls(
-            t - t_ref,
-            y - np.median(y),
-            ivar,
-            period_fmt,
-            duration,
-            oversample,
-            use_likelihood,
-        )
+        if bls is methods.bls_integrated:
+            results = bls(
+                t - t_ref,
+                y - np.median(y),
+                ivar,
+                exposure_time,
+                period_fmt,
+                duration,
+                oversample,
+                use_likelihood,
+            )
+        else:
+            results = bls(
+                t - t_ref,
+                y - np.median(y),
+                ivar,
+                period_fmt,
+                duration,
+                oversample,
+                use_likelihood,
+            )
 
         return self._format_results(t_ref, objective, period, results)
 
@@ -395,7 +421,26 @@ class BoxLeastSquares(BasePeriodogram):
             times[reset] = np.nan
         return times
 
-    def model(self, t_model, period, duration, transit_time):
+    def _model_exposure_time(self, t_model, exposure_time):
+        provided = exposure_time is not None
+        if exposure_time is None:
+            exposure_time = self.exposure_time
+        if isinstance(exposure_time, TimeDelta):
+            exposure_time = exposure_time.to(u.day)
+        elif isinstance(exposure_time, Time):
+            raise TypeError("exposure_time must be a duration, not an absolute time")
+        exposure_time = validate_unit_consistency(self._trel, exposure_time)
+        exposure_time = np.asarray(strip_units(exposure_time), dtype=np.float64)
+        t_model = np.asarray(t_model)
+        if exposure_time.ndim > 0 and exposure_time.shape != t_model.shape and provided:
+            raise ValueError(
+                "exposure_time must be scalar or have the same shape as t_model"
+            )
+        if exposure_time.ndim > 0 and exposure_time.shape != t_model.shape:
+            exposure_time = np.zeros_like(t_model, dtype=np.float64)
+        return np.broadcast_to(exposure_time, t_model.shape)
+
+    def model(self, t_model, period, duration, transit_time, exposure_time=None):
         """Compute the transit model at the given period, duration, and phase.
 
         Parameters
@@ -408,11 +453,16 @@ class BoxLeastSquares(BasePeriodogram):
             The duration of the transit.
         transit_time : float or `~astropy.units.Quantity` or `~astropy.time.Time`
             The mid-transit time of a reference transit.
+        exposure_time : float, array-like, or `~astropy.units.Quantity` ['time'], optional
+            Exposure duration centered on each value of ``t_model``. The
+            default is to use the exposure durations supplied when the
+            periodogram was initialized.
 
         Returns
         -------
         y_model : array-like or `~astropy.units.Quantity`
-            The model evaluated at the times ``t_model`` with units of ``y``.
+            The exposure-averaged model evaluated at the times ``t_model``
+            with units of ``y``.
 
         """
         period, duration = self._validate_period_and_duration(period, duration)
@@ -433,17 +483,24 @@ class BoxLeastSquares(BasePeriodogram):
                 1.0 / np.ascontiguousarray(strip_units(self.dy), dtype=np.float64) ** 2
             )
 
-        # Compute the depth
-        hp = 0.5 * period
-        m_in = np.abs((t - transit_time + hp) % period - hp) < 0.5 * duration
-        m_out = ~m_in
-        y_in = np.sum(y[m_in] * ivar[m_in]) / np.sum(ivar[m_in])
-        y_out = np.sum(y[m_out] * ivar[m_out]) / np.sum(ivar[m_out])
+        train_fraction = transit_fraction(
+            t,
+            strip_units(self.exposure_time),
+            period,
+            duration,
+            transit_time,
+        )
+        depth, y_out, _, _ = methods.weighted_box_stats(y, ivar, train_fraction)
 
-        # Evaluate the model
-        y_model = y_out + np.zeros_like(t_model)
-        m_model = np.abs((t_model - transit_time + hp) % period - hp) < 0.5 * duration
-        y_model[m_model] = y_in
+        model_exposure = self._model_exposure_time(t_model, exposure_time)
+        model_fraction = transit_fraction(
+            t_model,
+            model_exposure,
+            period,
+            duration,
+            transit_time,
+        )
+        y_model = y_out - depth * model_fraction
 
         return y_model * self._y_unit()
 
@@ -507,63 +564,126 @@ class BoxLeastSquares(BasePeriodogram):
             ivar = (
                 1.0 / np.ascontiguousarray(strip_units(self.dy), dtype=np.float64) ** 2
             )
+        exposure_time = strip_units(self.exposure_time)
 
-        # This a helper function that will compute the depth for several
-        # different hypothesized transit models with different parameters
-        def _compute_depth(m, y_out=None, var_out=None):
-            if np.any(m) and (var_out is None or np.isfinite(var_out)):
-                var_m = 1.0 / np.sum(ivar[m])
-                y_m = np.sum(y[m] * ivar[m]) * var_m
-                if y_out is None:
-                    return y_m, var_m
-                return y_out - y_m, np.sqrt(var_m + var_out)
-            return 0.0, np.inf
+        def _box_stats(fraction):
+            depth, baseline, depth_err, log_like = methods.weighted_box_stats(
+                y, ivar, fraction
+            )
+            return depth, depth_err, baseline, log_like
+
+        def _relative_depth(fraction, baseline, baseline_weight):
+            group_weight = np.sum(ivar * fraction)
+            if group_weight <= 0.0 or baseline_weight <= 0.0:
+                return 0.0, np.inf
+            group_flux = np.sum(ivar * fraction * y) / group_weight
+            return baseline - group_flux, np.sqrt(
+                1.0 / group_weight + 1.0 / baseline_weight
+            )
 
         # Compute the depth of the fiducial model and the two models at twice
         # the period
-        hp = 0.5 * period
-        m_in = np.abs((t - transit_time + hp) % period - hp) < 0.5 * duration
-        m_out = ~m_in
-        m_odd = np.abs((t - transit_time) % (2 * period) - period) < 0.5 * duration
-        m_even = (
-            np.abs((t - transit_time + period) % (2 * period) - period) < 0.5 * duration
+        fraction = transit_fraction(t, exposure_time, period, duration, transit_time)
+        fraction_odd = transit_fraction(
+            t, exposure_time, 2 * period, duration, transit_time + period
+        )
+        fraction_even = transit_fraction(
+            t, exposure_time, 2 * period, duration, transit_time
         )
 
-        y_out, var_out = _compute_depth(m_out)
-        depth = _compute_depth(m_in, y_out, var_out)
-        depth_odd = _compute_depth(m_odd, y_out, var_out)
-        depth_even = _compute_depth(m_even, y_out, var_out)
-        y_in = y_out - depth[0]
+        depth_value, depth_error, y_out, _ = _box_stats(fraction)
+        depth = depth_value, depth_error
+        baseline_weight = np.sum(ivar * (1.0 - fraction))
+        depth_odd = _relative_depth(fraction_odd, y_out, baseline_weight)
+        depth_even = _relative_depth(fraction_even, y_out, baseline_weight)
 
         # Compute the depth of the model at a phase of 0.5*period
-        m_phase = np.abs((t - transit_time) % period - hp) < 0.5 * duration
-        depth_phase = _compute_depth(m_phase, *_compute_depth((~m_phase) & m_out))
+        fraction_phase = transit_fraction(
+            t, exposure_time, period, duration, transit_time + 0.5 * period
+        )
+        phase_baseline = (1.0 - fraction) * (1.0 - fraction_phase)
+        phase_baseline_weight = np.sum(ivar * phase_baseline)
+        phase_baseline_flux = (
+            np.sum(ivar * phase_baseline * y) / phase_baseline_weight
+            if phase_baseline_weight > 0.0
+            else 0.0
+        )
+        depth_phase = _relative_depth(
+            fraction_phase,
+            phase_baseline_flux,
+            phase_baseline_weight,
+        )
 
         # Compute the depth of a model with a period of 0.5*period
-        m_half = (
-            np.abs((t - transit_time + 0.25 * period) % (0.5 * period) - 0.25 * period)
-            < 0.5 * duration
+        fraction_half = transit_fraction(
+            t, exposure_time, 0.5 * period, duration, transit_time
         )
-        depth_half = _compute_depth(m_half, *_compute_depth(~m_half))
+        depth_half = _box_stats(fraction_half)[:2]
 
-        # Compute the number of points in each transit
-        transit_id = np.round((t[m_in] - transit_time) / period).astype(int)
-        transit_times = (
-            period * np.arange(transit_id.min(), transit_id.max() + 1) + transit_time
-        )
-        unique_ids, unique_counts = np.unique(transit_id, return_counts=True)
-        unique_ids -= np.min(transit_id)
-        transit_id -= np.min(transit_id)
-        counts = np.zeros(np.max(transit_id) + 1, dtype=int)
-        counts[unique_ids] = unique_counts
+        # Compute the overlap of each exposure with each transit
+        exposure_broadcast = np.broadcast_to(exposure_time, t.shape)
+        if np.all(exposure_broadcast == 0.0):
+            transit_id = np.round((t[fraction > 0.0] - transit_time) / period).astype(
+                int
+            )
+            k_min = int(np.min(transit_id))
+            k_max = int(np.max(transit_id))
+        else:
+            k_min = int(
+                np.floor(
+                    np.min(
+                        t - 0.5 * exposure_broadcast - transit_time - 0.5 * duration
+                        / period
+                    )
+                )
+            )
+            k_max = int(
+                np.ceil(
+                    np.max(
+                        t + 0.5 * exposure_broadcast - transit_time + 0.5 * duration
+                        / period
+                    )
+                )
+            )
+        transit_ids = np.arange(k_min, k_max + 1)
+        transit_times = period * transit_ids + transit_time
+        counts = np.zeros(len(transit_ids))
 
         # Compute the per-transit log likelihood
-        ll = -0.5 * ivar[m_in] * ((y[m_in] - y_in) ** 2 - (y[m_in] - y_out) ** 2)
-        lls = np.zeros(len(counts))
-        for i in unique_ids:
-            lls[i] = np.sum(ll[transit_id == i])
-        full_ll = -0.5 * np.sum(ivar[m_in] * (y[m_in] - y_in) ** 2)
-        full_ll -= 0.5 * np.sum(ivar[m_out] * (y[m_out] - y_out) ** 2)
+        residual = y - y_out
+        lls = np.zeros(len(transit_ids))
+        for index, transit_id in enumerate(transit_ids):
+            fraction_event = single_transit_fraction(
+                t,
+                exposure_broadcast,
+                period,
+                duration,
+                transit_time,
+                transit_id,
+            )
+            counts[index] = np.sum(fraction_event)
+            event_fraction = np.divide(
+                fraction_event,
+                fraction,
+                out=np.zeros_like(fraction),
+                where=fraction > 0.0,
+            )
+            event_weight = event_fraction * ivar * fraction
+            if np.all(exposure_broadcast == 0.0):
+                lls[index] = np.sum(
+                    event_weight
+                    * 0.5
+                    * ((y - y_out) ** 2 - (y - y_out + depth_value) ** 2)
+                )
+            else:
+                lls[index] = np.sum(
+                    event_weight
+                    * (
+                        depth_value * residual
+                        - 0.5 * depth_value * depth_value * fraction
+                    )
+                )
+        full_ll = -0.5 * np.sum(ivar * (y - (y_out - depth_value * fraction)) ** 2)
 
         # Compute the log likelihood of a sine model
         A = np.vstack(
@@ -597,7 +717,7 @@ class BoxLeastSquares(BasePeriodogram):
             harmonic_delta_log_likelihood=(sin_ll - full_ll) * ll_unit,
         )
 
-    def transit_mask(self, t, period, duration, transit_time):
+    def transit_mask(self, t, period, duration, transit_time, exposure_time=None):
         """Compute which data points are in transit for a given parameter set.
 
         Parameters
@@ -610,26 +730,28 @@ class BoxLeastSquares(BasePeriodogram):
             The duration of the transit.
         transit_time : float or `~astropy.units.Quantity` or `~astropy.time.Time`
             The mid-transit time of a reference transit.
+        exposure_time : float, array-like, or `~astropy.units.Quantity` ['time'], optional
+            Exposure duration centered on each value of ``t``.
 
         Returns
         -------
         transit_mask : array-like
-            A boolean array where ``True`` indicates and in transit point and
-            ``False`` indicates and out-of-transit point.
+            A boolean array where ``True`` indicates an exposure that overlaps
+            a transit window and ``False`` indicates an out-of-transit point.
 
         """
         period, duration = self._validate_period_and_duration(period, duration)
         transit_time = self._as_relative_time("transit_time", transit_time)
         t = strip_units(self._as_relative_time("t", t))
+        exposure_time = self._model_exposure_time(t, exposure_time)
 
         period = float(strip_units(period[0]))
         duration = float(strip_units(duration[0]))
         transit_time = float(strip_units(transit_time))
 
-        hp = 0.5 * period
-        return np.abs((t - transit_time + hp) % period - hp) < 0.5 * duration
+        return transit_fraction(t, exposure_time, period, duration, transit_time) > 0.0
 
-    def _validate_inputs(self, t, y, dy):
+    def _validate_inputs(self, t, y, dy, exposure_time=None):
         """Private method used to check the consistency of the inputs.
 
         Parameters
@@ -640,10 +762,13 @@ class BoxLeastSquares(BasePeriodogram):
             Sequence of observations associated with times t.
         dy : float, array-like, or `~astropy.units.Quantity`
             Error or sequence of observational errors associated with times t.
+        exposure_time : float, array-like, or `~astropy.units.Quantity` ['time'], optional
+            Duration of each observation exposure.
 
         Returns
         -------
-        t, y, dy : array-like, `~astropy.units.Quantity`, or `~astropy.time.Time`
+        t, y, dy, exposure_time : array-like, `~astropy.units.Quantity`, or
+            `~astropy.time.Time`
             The inputs with consistent shapes and units.
 
         Raises
@@ -654,18 +779,36 @@ class BoxLeastSquares(BasePeriodogram):
 
         """
         # Validate shapes of inputs
-        if dy is None:
-            t, y = np.broadcast_arrays(t, y, subok=True)
+        arrays = [t, y]
+        if dy is not None:
+            arrays.append(dy)
+        if exposure_time is not None:
+            if isinstance(exposure_time, Time):
+                raise TypeError(
+                    "exposure_time must be a duration, not an absolute time"
+                )
+            if isinstance(exposure_time, TimeDelta):
+                exposure_time = exposure_time.to(u.day)
+            exposure_time = validate_unit_consistency(t, exposure_time)
+            arrays.append(exposure_time)
+        arrays = np.broadcast_arrays(*arrays, subok=True)
+        t, y = arrays[:2]
+        if dy is not None:
+            dy = arrays[2]
+        if exposure_time is not None:
+            exposure_time = arrays[-1]
         else:
-            t, y, dy = np.broadcast_arrays(t, y, dy, subok=True)
+            exposure_time = np.zeros_like(t, subok=True)
         if t.ndim != 1:
-            raise ValueError("Inputs (t, y, dy) must be 1-dimensional")
+            raise ValueError("Inputs (t, y, dy, exposure_time) must be 1-dimensional")
+        if np.any(np.asarray(strip_units(exposure_time)) < 0.0):
+            raise ValueError("exposure_time must be non-negative")
 
         # validate units of inputs if any is a Quantity
         if dy is not None:
             dy = validate_unit_consistency(y, dy)
 
-        return t, y, dy
+        return t, y, dy, exposure_time
 
     def _validate_duration(self, duration):
         """Private method used to check a set of test durations.

@@ -1,0 +1,5 @@
+``BoxLeastSquares`` now accepts an ``exposure_time`` argument with the duration
+of each observation. Power calculations, models, and transit masks consistently
+average box-shaped transits over these exposure windows, including windows that
+cross a phase boundary or span more than one period. A zero duration reproduces
+the previous instantaneous-observation behavior.

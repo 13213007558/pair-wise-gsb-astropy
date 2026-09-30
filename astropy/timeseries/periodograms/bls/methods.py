@@ -7,6 +7,7 @@ from functools import partial
 import numpy as np
 
 from ._impl import bls_impl
+from .window import transit_fraction
 
 
 def bls_slow(t, y, ivar, period, duration, oversample, use_likelihood):
@@ -92,6 +93,45 @@ def bls_fast(t, y, ivar, period, duration, oversample, use_likelihood):
     return bls_impl(t, y, ivar, period, duration, oversample, use_likelihood)
 
 
+def bls_integrated(
+    t, y, ivar, exposure_time, period, duration, oversample, use_likelihood
+):
+    """Compute the periodogram using exact exposure-window averages."""
+    f = partial(
+        _bls_integrated_one,
+        t,
+        y,
+        ivar,
+        exposure_time,
+        duration,
+        oversample,
+        use_likelihood,
+    )
+    return _apply(f, period)
+
+
+def weighted_box_stats(y, ivar, fraction):
+    """Fit a constant plus a box shape with exposure-overlap fractions."""
+    weight = ivar
+    weighted_y = weight * y
+    w = np.sum(weight)
+    wq = np.sum(weight * fraction)
+    wqq = np.sum(weight * fraction * fraction)
+    wy = np.sum(weighted_y)
+    wqy = np.sum(weighted_y * fraction)
+    determinant = w * wqq - wq * wq
+
+    if determinant <= 0.0:
+        baseline = wy / w if w > 0.0 else 0.0
+        return 0.0, baseline, np.inf, 0.0
+
+    baseline = (wy * wqq - wqy * wq) / determinant
+    depth = (wq * wy - w * wqy) / determinant
+    depth_var = w / determinant
+    log_likelihood = 0.5 * depth * depth / depth_var if depth_var > 0.0 else 0.0
+    return depth, baseline, np.sqrt(depth_var), log_likelihood
+
+
 def _bls_slow_one(t, y, ivar, duration, oversample, use_likelihood, period):
     """A private function to compute the brute force periodogram result."""
     best = (-np.inf, None)
@@ -140,6 +180,45 @@ def _bls_slow_one(t, y, ivar, duration, oversample, use_likelihood, period):
                         (t0 + min_t) % period,
                         snr,
                         loglike,
+                    ),
+                )
+
+    return best[1]
+
+
+def _bls_integrated_one(
+    t, y, ivar, exposure_time, duration, oversample, use_likelihood, period
+):
+    """Compute the exact integrated result for one period."""
+    best = (-np.inf, None)
+    min_t = np.min(t)
+    for trial_duration in duration:
+        phase_step = trial_duration / oversample
+        phase = np.arange(0, period, phase_step)
+
+        for transit_time in phase:
+            fraction = transit_fraction(
+                t,
+                exposure_time,
+                period,
+                trial_duration,
+                min_t + transit_time,
+            )
+            depth, _, depth_err, log_like = weighted_box_stats(y, ivar, fraction)
+            snr = depth / depth_err if np.isfinite(depth_err) and depth_err > 0 else 0
+            objective = log_like if use_likelihood else snr
+
+            if depth > 0 and objective > best[0]:
+                best = (
+                    objective,
+                    (
+                        objective,
+                        depth,
+                        depth_err,
+                        trial_duration,
+                        transit_time,
+                        snr,
+                        log_like,
                     ),
                 )
 

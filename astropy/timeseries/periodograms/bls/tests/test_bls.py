@@ -100,6 +100,148 @@ def test_correct_model(data, objective):
 
 
 @pytest.mark.parametrize("objective", ["likelihood", "snr"])
+def test_exposure_time_recovers_injected_depth(objective):
+    period = 2.0
+    duration = 0.2
+    transit_time = 0.0
+    exposure_time = 0.4
+    depth = 0.2
+
+    t = np.linspace(0.0, 10.0, 1001, endpoint=False)
+    transit_cycles = np.arange(-1, 7)
+    fraction = np.zeros_like(t)
+    for cycle in transit_cycles:
+        center = transit_time + cycle * period
+        fraction += np.maximum(
+            0.0,
+            np.minimum(t + 0.5 * exposure_time, center + 0.5 * duration)
+            - np.maximum(t - 0.5 * exposure_time, center - 0.5 * duration),
+        )
+    fraction /= exposure_time
+    y = 1.0 - depth * fraction
+    dy = np.linspace(0.01, 0.02, t.size)
+
+    model = BoxLeastSquares(t, y, dy, exposure_time=exposure_time)
+    results = model.power(
+        period, duration, objective=objective, oversample=20
+    )
+    results_slow = model.power(
+        period,
+        duration,
+        objective=objective,
+        oversample=20,
+        method="slow",
+    )
+    assert_allclose_blsresults(results, results_slow)
+
+    assert_allclose(results.depth[0], depth, atol=1e-6)
+    assert_allclose(results.duration[0], duration)
+    assert_allclose(
+        results.transit_time[0] % period, transit_time, atol=1e-10
+    )
+
+    fitted_model = model.model(t, period, duration, transit_time)
+    assert_allclose(fitted_model, y, atol=1e-10)
+
+    mask = model.transit_mask(t, period, duration, transit_time)
+    assert_equal(mask, fraction > 0.0)
+
+
+def test_exposure_time_longer_than_period():
+    period = 2.0
+    duration = 0.2
+    transit_time = 0.5
+    exposure_time = 2.4
+    depth = 0.2
+
+    t = np.linspace(0.0, 10.0, 1001, endpoint=False)
+    transit_cycles = np.arange(-3, 8)
+    fraction = np.zeros_like(t)
+    for cycle in transit_cycles:
+        center = transit_time + cycle * period
+        fraction += np.maximum(
+            0.0,
+            np.minimum(t + 0.5 * exposure_time, center + 0.5 * duration)
+            - np.maximum(t - 0.5 * exposure_time, center - 0.5 * duration),
+        )
+    fraction /= exposure_time
+    y = 1.0 - depth * fraction
+
+    model = BoxLeastSquares(t, y, exposure_time=exposure_time)
+    results = model.power(period, duration, oversample=20)
+
+    assert_allclose(results.depth[0], depth, atol=1e-6)
+    assert_allclose(
+        model.model(
+            t, period, duration, transit_time, exposure_time=exposure_time
+        ),
+        y,
+        atol=1e-10,
+    )
+
+
+def test_exposure_time_units_and_broadcasting():
+    period = 2.0
+    duration = 0.2
+    transit_time = 0.0
+    exposure_time = 0.4
+    depth = 0.2
+
+    t = np.linspace(0.0, 10.0, 1001, endpoint=False)
+    transit_cycles = np.arange(-1, 7)
+    fraction = np.zeros_like(t)
+    for cycle in transit_cycles:
+        center = transit_time + cycle * period
+        fraction += np.maximum(
+            0.0,
+            np.minimum(t + 0.5 * exposure_time, center + 0.5 * duration)
+            - np.maximum(t - 0.5 * exposure_time, center - 0.5 * duration),
+        )
+    fraction /= exposure_time
+
+    y = (1.0 - depth * fraction) * u.mag
+    dy = np.linspace(0.01, 0.02, t.size) * u.mag
+    model = BoxLeastSquares(t * u.day, y, dy, exposure_time=9.6 * u.hour)
+    results = model.power(
+        period * u.day, duration * u.day, oversample=20
+    )
+
+    assert results.depth.unit == u.mag
+    assert results.transit_time.unit == u.day
+    assert_allclose(results.depth[0].value, depth, atol=1e-6)
+    assert model.exposure_time.shape == t.shape
+
+    per_observation = np.full_like(t, exposure_time) * u.day
+    model_per_observation = BoxLeastSquares(
+        t * u.day, y, dy, exposure_time=per_observation
+    )
+    results_per_observation = model_per_observation.power(
+        period * u.day, duration * u.day, oversample=20
+    )
+    assert_allclose_blsresults(results, results_per_observation)
+
+
+def test_zero_exposure_time_matches_instantaneous(data):
+    t, y, dy, params = data
+    periods = np.array([1.5, 2.0, 2.5])
+
+    model_none = BoxLeastSquares(t, y, dy)
+    model_zero = BoxLeastSquares(t, y, dy, exposure_time=0.0)
+
+    results_none = model_none.power(periods, params["duration"])
+    results_zero = model_zero.power(periods, params["duration"])
+    assert_allclose_blsresults(results_none, results_zero)
+
+    mask_none = model_none.transit_mask(
+        t, params["period"], params["duration"], params["transit_time"]
+    )
+    mask_zero = model_zero.transit_mask(
+        t, params["period"], params["duration"], params["transit_time"]
+    )
+    assert_equal(mask_none, mask_zero)
+
+
+@pytest.mark.parametrize("objective", ["likelihood", "snr"])
 @pytest.mark.parametrize("offset", [False, True])
 def test_fast_method(data, objective, offset):
     t, y, dy, params = data
